@@ -5,20 +5,22 @@ from sklearn.metrics import log_loss
 from catboost import CatBoostClassifier, Pool
 
 # ---------------------------------------------------------
-# 1. Load Data
+# 1. Load Datasets & Extract Exact Output Specification
 # ---------------------------------------------------------
 train = pd.read_csv('Train.csv')
 test = pd.read_csv('Test.csv')
 sample_sub = pd.read_csv('SampleSubmission.csv')
 
-target_col = 'cost_category'
-id_col = 'Tour_ID'
-target_classes = ['High Cost', 'Higher Cost', 'Highest Cost', 'Low Cost', 'Lower Cost', 'Normal Cost']
+# Extract ID column and target classes directly from Sample Submission
+id_col = sample_sub.columns[0]  # 'Tour_ID'
+target_classes = list(sample_sub.columns[1:])  # ['High Cost', 'Higher Cost', 'Highest Cost', 'Low Cost', 'Lower Cost', 'Normal Cost']
 
-# Map string labels to numeric integers (0 to 5) for multi-class training
+# Create mapping from target class string to class index
 class_to_idx = {cls_name: i for i, cls_name in enumerate(target_classes)}
 idx_to_class = {i: cls_name for i, cls_name in enumerate(target_classes)}
-train['target'] = train[target_col].map(class_to_idx)
+
+# Map train target column to integer indices matching sample submission
+train['target'] = train['cost_category'].map(class_to_idx)
 
 # ---------------------------------------------------------
 # 2. Data Preprocessing & Feature Engineering
@@ -26,19 +28,20 @@ train['target'] = train[target_col].map(class_to_idx)
 def preprocess_data(df):
     df = df.copy()
     
-    # Clean typos
-    df['main_activity'] = df['main_activity'].replace({'Widlife Tourism': 'Wildlife Tourism'})
+    # Fix dataset typos
+    if 'main_activity' in df.columns:
+        df['main_activity'] = df['main_activity'].replace({'Widlife Tourism': 'Wildlife Tourism'})
     
-    # Handle missing values explicitly as text/numeric categories
+    # Handle missing values explicitly
     df['travel_with'] = df['travel_with'].fillna('Alone')
     df['total_female'] = df['total_female'].fillna(0)
     df['total_male'] = df['total_male'].fillna(0)
     
-    # Feature Engineering
+    # Domain Feature Engineering
     df['total_people'] = df['total_female'] + df['total_male']
     df['total_nights'] = df['night_mainland'] + df['night_zanzibar']
     
-    # Package inclusions aggregator
+    # Sum of package perks included
     package_cols = [
         'package_transport_int', 'package_accomodation', 'package_food',
         'package_transport_tz', 'package_sightseeing', 'package_guided_tour',
@@ -54,7 +57,6 @@ test_df = preprocess_data(test)
 # ---------------------------------------------------------
 # 3. Categorical Feature Specification
 # ---------------------------------------------------------
-# Define all string/categorical columns for CatBoost
 cat_features = [
     'country', 'age_group', 'travel_with', 'purpose', 'main_activity', 
     'info_source', 'tour_arrangement', 'package_transport_int', 
@@ -62,19 +64,19 @@ cat_features = [
     'package_sightseeing', 'package_guided_tour', 'package_insurance', 'first_trip_tz'
 ]
 
-# Ensure categorical columns are strings (CatBoost requirement for cat_features)
+# Ensure categorical columns are strings for CatBoost
 for col in cat_features:
     train_df[col] = train_df[col].astype(str)
     test_df[col] = test_df[col].astype(str)
 
-features = [col for col in train_df.columns if col not in [id_col, target_col, 'target']]
+features = [col for col in train_df.columns if col not in [id_col, 'cost_category', 'target']]
 
 X = train_df[features]
 y = train_df['target']
 X_test = test_df[features]
 
 # ---------------------------------------------------------
-# 4. Stratified 5-Fold Cross-Validation with CatBoost
+# 4. Stratified K-Fold Cross-Validation & Training
 # ---------------------------------------------------------
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
@@ -99,7 +101,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
         loss_function='MultiClass',
         eval_metric='MultiClass',
         random_seed=42,
-        task_type='CPU', # Change to 'GPU' if running with CUDA
+        task_type='CPU',  # Set to 'GPU' if running on a GPU instance
         verbose=200
     )
     
@@ -110,25 +112,33 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
         use_best_model=True
     )
     
-    # Store Out-of-Fold predictions and test predictions
     oof_preds[val_idx] = model.predict_proba(val_pool)
     test_preds += model.predict_proba(test_pool) / skf.n_splits
 
-# Overall Out-Of-Fold Multi-Class Log Loss Metric
-cv_log_loss = log_loss(y, oof_preds)
+# Print Out-of-Fold validation score
+cv_loss = log_loss(y, oof_preds)
 print(f"\n==========================================")
-print(f"Overall OOF Log Loss: {cv_log_loss:.5f}")
+print(f"Overall OOF Log Loss: {cv_loss:.5f}")
 print(f"==========================================")
 
 # ---------------------------------------------------------
-# 5. Build Final Submission
+# 5. Export Exactly Aligned Submission
 # ---------------------------------------------------------
+# Create prediction DataFrame with columns ordered by class index
 submission = pd.DataFrame(test_preds, columns=[idx_to_class[i] for i in range(len(target_classes))])
 submission.insert(0, id_col, test_df[id_col])
 
-# Reorder columns to strictly match SampleSubmission.csv
-target_order = ['Tour_ID', 'High Cost', 'Higher Cost', 'Highest Cost', 'Low Cost', 'Lower Cost', 'Normal Cost']
-submission = submission[target_order]
+# Strictly match SampleSubmission.csv column order
+submission = submission[sample_sub.columns]
 
+# Ensure row order matches SampleSubmission.csv
+submission = sample_sub[[id_col]].merge(submission, on=id_col, how='left')
+
+# Verification checks
+assert list(submission.columns) == list(sample_sub.columns), "Column alignment mismatch!"
+assert (submission[id_col] == sample_sub[id_col]).all(), "ID order mismatch!"
+assert submission.isnull().sum().sum() == 0, "Submission contains null values!"
+
+# Save final CSV file
 submission.to_csv('catboost_submission.csv', index=False)
-print("Saved predictions to catboost_submission.csv")
+print("catboost_submission.csv saved successfully!")
